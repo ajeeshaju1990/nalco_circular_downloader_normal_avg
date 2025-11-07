@@ -1,1 +1,93 @@
+name: Nalco PDF Downloader
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # 09:00, 12:00, 15:00, 18:00 IST = 03:30, 06:30, 09:30, 12:30 UTC
+    - cron: "30 3,6,9,12 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nalco-pdf-downloader
+  cancel-in-progress: true
+
+env:
+  # Optional: your script supports BASE_DIR, but root is fine
+  BASE_DIR: .
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install requests beautifulsoup4 lxml pdfplumber pandas openpyxl
+          fi
+
+      - name: Ensure output directories exist
+        run: |
+          mkdir -p pdfs
+          mkdir -p data
+
+      - name: Run scraper
+        env:
+          BASE_DIR: ${{ env.BASE_DIR }}
+        run: |
+          echo "PWD before run: $(pwd)"
+          python nalco_scraper.py
+          echo "Scraper finished."
+
+      - name: List outputs
+        run: |
+          echo "--- pdfs/"
+          ls -la pdfs || true
+          echo "--- data/"
+          ls -la data || true
+
+      # Upload artifacts only if they exist (v4 required)
+      - name: Upload PDF artifacts (if any)
+        if: ${{ hashFiles('pdfs/*.pdf') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: nalco-pdfs
+          path: pdfs/*.pdf
+          if-no-files-found: ignore
+
+      - name: Upload Excel artifact (if exists)
+        if: ${{ hashFiles('data/nalco_prices.xlsx') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: nalco-prices-xlsx
+          path: data/nalco_prices.xlsx
+          if-no-files-found: ignore
+
+      - name: Commit & push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "Update Nalco data ($(date -u +'%Y-%m-%d %H:%M:%S UTC'))"
+            git push
+          else
+            echo "No changes to commit."
+          fi
 
