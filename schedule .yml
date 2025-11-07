@@ -1,0 +1,60 @@
+name: Daily Hindalco PDF Download
+
+on:
+  schedule:
+    - cron: '30 0 * * *'
+    - cron: '30 3 * * *'
+    - cron: '30 6 * * *'
+    - cron: '30 9 * * *'
+    - cron: '30 12 * * *'
+    - cron: '30 15 * * *'
+    - cron: '30 18 * * *'
+    - cron: '30 21 * * *'
+  workflow_dispatch:
+    inputs:
+      backfill:
+        description: "Process ALL existing PDFs once"
+        required: false
+        default: "false"
+      repair:
+        description: "Cleanup Excel (dedupe + renumber Sl.no. by date asc)"
+        required: false
+        default: "false"
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install requirements
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download + Extract + Update Excel
+        run: |
+          python hindalco_pipeline.py --backfill "${{ github.event.inputs.backfill }}" --repair "${{ github.event.inputs.repair }}"
+
+      - name: Commit and push changes
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name  "github-actions[bot]"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Hindalco: update PDFs & Excel ($(date -u +'%Y-%m-%d %H:%M:%S UTC'))"
+            git push
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
