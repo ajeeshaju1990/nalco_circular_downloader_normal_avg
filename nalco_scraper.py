@@ -16,7 +16,7 @@ NALCO_URL = "https://nalcoindia.com/domestic/current-price/"
 PDF_DIR = pathlib.Path("pdfs")
 DATA_DIR = pathlib.Path("data")
 LOG_FILE = DATA_DIR / "latest_nalco_pdf.txt"
-EXCEL_FILE = DATA_DIR / "nalco_prices.xlsx"
+EXCEL_FILE = DATA_DIR / "nalco_normal_avg_prices.xlsx"
 RUNLOG_FILE = DATA_DIR / "nalco_run_log.xlsx"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
