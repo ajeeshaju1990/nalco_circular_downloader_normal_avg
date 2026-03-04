@@ -215,13 +215,13 @@ def save_excel_formatted(df: pd.DataFrame, path: pathlib.Path):
     center = Alignment(horizontal="center", vertical="center")
 
     # Auto width
-    for col_idx, col_name in enumerate(df.columns, start=1):
-        max_len = len(str(col_name))
-        for val in df[col_name].astype(str).values:
-            if val is None:
-                continue
-            max_len = max(max_len, len(val))
-        ws.column_dimensions[get_column_letter(col_idx)].width = max(10, min(max_len + 2, 80))
+    
+      for col_idx, col_name in enumerate(df.columns, start=1):
+          max_len = len(str(col_name))
+          for val in df[col_name].values:
+              sval = "" if pd.isna(val) else str(val)
+              max_len = max(max_len, len(sval))
+          ws.column_dimensions[get_column_letter(col_idx)].width = max(10, min(max_len + 2, 100)
 
     header_row = 1
     nrows = ws.max_row
