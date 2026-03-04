@@ -3,6 +3,7 @@ import sys
 import time
 import pathlib
 import re
+import shutil
 import requests
 import datetime
 from urllib.parse import urljoin, urlparse
@@ -26,6 +27,10 @@ LOG_FILE = DATA_DIR / "latest_nalco_pdf.txt"
 EXCEL_FILE = DATA_DIR / "nalco_prices.xlsx"
 RUNLOG_FILE = DATA_DIR / "nalco_run_log.xlsx"
 
+# Manual backfill inputs (you upload these)
+MANUAL_BACKFILL_FILE = DATA_DIR / "manual_backfill.xlsx"
+MANUAL_PDF_DIR = pathlib.Path("manual_pdfs")
+
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -35,18 +40,15 @@ UA = (
 DATEY_PDF_RE = re.compile(r"Ingot-(\d{2})-(\d{2})-(\d{4})\.pdf$", re.IGNORECASE)
 
 # Final Excel column order
-EXCEL_COLS = [
-    "Sl.no.",
-    "Description",
-    "Product Code",
-    "Basic Price",
-    "Circular Date",
-    "Circular Link",
-]
+EXCEL_COLS = ["Sl.no.", "Description", "Product Code", "Basic Price", "Circular Date", "Circular Link"]
 
-# ---------------------- HELPERS ----------------------
+# Runlog columns
+RUNLOG_COLS = ["Run UTC", "Run IST", "Status", "Message", "Chosen URL", "Saved PDF", "Rows Appended", "Total Rows After"]
+
+# ---------------------- GENERIC HELPERS ----------------------
 
 def ensure_dirs():
+    """Create required output directories. Does NOT delete manual_pdfs/."""
     for p in (PDF_DIR, DATA_DIR):
         if p.exists() and p.is_file():
             p.unlink()
@@ -69,15 +71,14 @@ def safe_str(v) -> str:
 def now_times():
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     now_ist = now_utc.astimezone(ZoneInfo("Asia/Kolkata"))
-    return (
-        now_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
-        now_ist.strftime("%Y-%m-%d %H:%M:%S IST"),
-    )
+    return now_utc.strftime("%Y-%m-%d %H:%M:%S UTC"), now_ist.strftime("%Y-%m-%d %H:%M:%S IST")
 
 def get_session():
     s = requests.Session()
     s.headers.update({"User-Agent": UA})
     return s
+
+# ---------------------- SCRAPER UTILS ----------------------
 
 def get_html(session: requests.Session, url: str) -> str:
     r = session.get(url, timeout=60)
@@ -222,11 +223,7 @@ def extract_row_ie07(pdf_path: pathlib.Path) -> dict:
                     desc = (m_desc.group(1) if m_desc else "ALUMINIUM INGOT").strip().upper()
 
                     if price:
-                        return {
-                            "Description": desc,
-                            "Product Code": "IE07",
-                            "Basic Price": price,
-                        }
+                        return {"Description": desc, "Product Code": "IE07", "Basic Price": price}
 
     raise RuntimeError("Could not find a row with Product Code IE07 in the PDF.")
 
@@ -289,45 +286,165 @@ def save_excel_formatted(df: pd.DataFrame, path: pathlib.Path):
                 cell.number_format = "0.000"
 
             if r > header_row and c == link_col_idx:
-                val = cell.value
-                if isinstance(val, str) and val.startswith("http"):
-                    cell.hyperlink = val
+                v = cell.value
+                if isinstance(v, str) and v.startswith("http"):
+                    cell.hyperlink = v
 
     ws.freeze_panes = "A2"
     wb.save(path)
 
-def append_to_excel(excel_path: pathlib.Path, row: dict) -> int:
-    """
-    Append a row, assign next Sl.no. based on existing max (robust even after sorting),
-    then sort by Circular Date (desc) before saving with formatting.
-    Returns total rows after append.
-    """
-    excel_path.parent.mkdir(parents=True, exist_ok=True)
-
+def load_main_df(excel_path: pathlib.Path) -> pd.DataFrame:
+    """Load nalco_prices.xlsx if it exists; otherwise return empty DF with correct columns."""
     if excel_path.exists():
         df = pd.read_excel(excel_path, dtype={"Sl.no.": "Int64"}, engine="openpyxl")
         for c in EXCEL_COLS:
             if c not in df.columns:
                 df[c] = pd.NA
         df = df[EXCEL_COLS]
-        next_slno = int(df["Sl.no."].max()) + 1 if df["Sl.no."].notna().any() else 1
-    else:
-        df = pd.DataFrame(columns=EXCEL_COLS)
-        next_slno = 1
+        return df
+    return pd.DataFrame(columns=EXCEL_COLS)
+
+def append_to_excel(excel_path: pathlib.Path, row: dict) -> tuple[int, int]:
+    """
+    Append a row, assign next Sl.no. based on existing max (robust even after sorting),
+    then sort by Circular Date (desc) before saving with formatting.
+    Returns: (rows_appended, total_rows_after)
+    """
+    df = load_main_df(excel_path)
+
+    next_slno = int(df["Sl.no."].max()) + 1 if df["Sl.no."].notna().any() else 1
 
     new_row = {
         "Sl.no.": next_slno,
-        "Description": row["Description"],
-        "Product Code": row["Product Code"],
-        "Basic Price": row["Basic Price"],  # already divided by 1000 upstream
-        "Circular Date": row["Circular Date"],
-        "Circular Link": row["Circular Link"],
+        "Description": row.get("Description", ""),
+        "Product Code": row.get("Product Code", ""),
+        "Basic Price": row.get("Basic Price", pd.NA),
+        "Circular Date": row.get("Circular Date", ""),
+        "Circular Link": row.get("Circular Link", ""),
     }
 
     df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
     df = sort_and_format_df(df)
     save_excel_formatted(df, excel_path)
-    return df.shape[0]
+    return 1, df.shape[0]
+
+# ---------------------- MANUAL BACKFILL + PDF SYNC ----------------------
+
+def normalize_date_ddmmyyyy(val) -> str | None:
+    dt = pd.to_datetime(val, dayfirst=True, errors="coerce")
+    if pd.isna(dt):
+        return None
+    return dt.strftime("%d-%m-%Y")
+
+def normalize_price_3dp(val) -> float | None:
+    try:
+        if pd.isna(val):
+            return None
+    except Exception:
+        pass
+    try:
+        return round(float(str(val).replace(",", "").strip()), 3)
+    except Exception:
+        return None
+
+def make_dedupe_key(circular_date: str, product_code: str, basic_price) -> tuple | None:
+    """
+    Duplicate detection key: (Circular Date + Product Code + Basic Price)
+    - Date is normalized to DD-MM-YYYY
+    - Code upper stripped
+    - Price float rounded 3 decimals
+    """
+    d = normalize_date_ddmmyyyy(circular_date)
+    if not d:
+        return None
+    code = (product_code or "").strip().upper()
+    if not code:
+        return None
+    price = normalize_price_3dp(basic_price)
+    if price is None:
+        return None
+    return (d, code, price)
+
+def merge_manual_backfill(manual_path: pathlib.Path, main_excel_path: pathlib.Path) -> tuple[int, int]:
+    """
+    If manual backfill exists:
+      - read it
+      - align columns
+      - append only rows not in main file (dedupe by date+code+price)
+    Returns: (rows_appended, total_rows_after)
+    """
+    main_df = load_main_df(main_excel_path)
+    main_df["Basic Price"] = pd.to_numeric(main_df["Basic Price"], errors="coerce").round(3)
+    main_total_before = int(main_df.shape[0])
+
+    if not manual_path.exists():
+        return 0, main_total_before
+
+    manual_df = pd.read_excel(manual_path, engine="openpyxl")
+
+    # Ensure required columns exist (create if missing)
+    for c in EXCEL_COLS:
+        if c not in manual_df.columns:
+            manual_df[c] = pd.NA
+    manual_df = manual_df[EXCEL_COLS].copy()
+
+    # Normalize types for key generation
+    manual_df["Product Code"] = manual_df["Product Code"].astype(str).str.strip().str.upper()
+    manual_df["Circular Date"] = manual_df["Circular Date"].apply(normalize_date_ddmmyyyy)
+    manual_df["Basic Price"] = manual_df["Basic Price"].apply(normalize_price_3dp)
+
+    # Drop rows that can't form key
+    manual_df["_key"] = manual_df.apply(
+        lambda r: make_dedupe_key(r["Circular Date"], r["Product Code"], r["Basic Price"]), axis=1
+    )
+    manual_df = manual_df[manual_df["_key"].notna()].copy()
+
+    # Build existing key set from main DF
+    main_keys = set()
+    if main_total_before > 0:
+        tmp = main_df.copy()
+        tmp["Product Code"] = tmp["Product Code"].astype(str).str.strip().str.upper()
+        tmp["Circular Date"] = tmp["Circular Date"].apply(normalize_date_ddmmyyyy)
+        tmp["Basic Price"] = tmp["Basic Price"].apply(normalize_price_3dp)
+        tmp["_key"] = tmp.apply(lambda r: make_dedupe_key(r["Circular Date"], r["Product Code"], r["Basic Price"]), axis=1)
+        main_keys = set([k for k in tmp["_key"].tolist() if k is not None])
+
+    # Filter only new rows
+    new_rows = manual_df[~manual_df["_key"].isin(main_keys)].copy()
+    new_rows.drop(columns=["_key"], inplace=True, errors="ignore")
+
+    if new_rows.empty:
+        return 0, main_total_before
+
+    # Assign new Sl.no. sequentially
+    next_slno = int(main_df["Sl.no."].max()) + 1 if main_df["Sl.no."].notna().any() else 1
+    new_rows = new_rows.reset_index(drop=True)
+    new_rows["Sl.no."] = range(next_slno, next_slno + len(new_rows))
+
+    # Append and save
+    combined = pd.concat([main_df, new_rows], ignore_index=True)
+    combined = sort_and_format_df(combined)
+    save_excel_formatted(combined, main_excel_path)
+
+    return int(len(new_rows)), int(combined.shape[0])
+
+def sync_manual_pdfs(src_dir: pathlib.Path, dest_dir: pathlib.Path) -> int:
+    """
+    Copy PDFs from manual_pdfs/ into pdfs/ (idempotent).
+    Returns number of PDFs copied.
+    """
+    if not src_dir.exists() or not src_dir.is_dir():
+        return 0
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    for f in src_dir.iterdir():
+        if f.is_file() and f.suffix.lower() == ".pdf":
+            dest = dest_dir / f.name
+            if not dest.exists():
+                shutil.copy2(f, dest)
+                copied += 1
+    return copied
 
 # ---------------------- RUN LOG HELPERS ----------------------
 
@@ -336,17 +453,7 @@ def append_runlog(log_path: pathlib.Path, info: dict):
     Append (or create) a run log Excel separate from the main data file.
     Columns: Run UTC, Run IST, Status, Message, Chosen URL, Saved PDF, Rows Appended, Total Rows After
     """
-    cols = [
-        "Run UTC",
-        "Run IST",
-        "Status",
-        "Message",
-        "Chosen URL",
-        "Saved PDF",
-        "Rows Appended",
-        "Total Rows After",
-    ]
-
+    cols = RUNLOG_COLS
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     if log_path.exists():
@@ -358,32 +465,21 @@ def append_runlog(log_path: pathlib.Path, info: dict):
     else:
         df = pd.DataFrame(columns=cols)
 
-    df = pd.concat(
-        [
-            df,
-            pd.DataFrame(
-                [
-                    {
-                        "Run UTC": info.get("Run UTC"),
-                        "Run IST": info.get("Run IST"),
-                        "Status": info.get("Status"),
-                        "Message": info.get("Message"),
-                        "Chosen URL": info.get("Chosen URL"),
-                        "Saved PDF": info.get("Saved PDF"),
-                        "Rows Appended": info.get("Rows Appended"),
-                        "Total Rows After": info.get("Total Rows After"),
-                    }
-                ]
-            ),
-        ],
-        ignore_index=True,
-    )
+    df = pd.concat([df, pd.DataFrame([{
+        "Run UTC": info.get("Run UTC"),
+        "Run IST": info.get("Run IST"),
+        "Status": info.get("Status"),
+        "Message": info.get("Message"),
+        "Chosen URL": info.get("Chosen URL"),
+        "Saved PDF": info.get("Saved PDF"),
+        "Rows Appended": info.get("Rows Appended"),
+        "Total Rows After": info.get("Total Rows After"),
+    }])], ignore_index=True)
 
     # Keep numeric columns clean (avoid floats like 1.0 where possible)
     for c in ["Rows Appended", "Total Rows After"]:
         df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
 
-    # Save and format
     df.to_excel(log_path, index=False, engine="openpyxl")
     wb = load_workbook(log_path)
     ws = wb.active
@@ -405,10 +501,7 @@ def append_runlog(log_path: pathlib.Path, info: dict):
     wb.save(log_path)
 
 def safe_append_runlog(log_path: pathlib.Path, info: dict):
-    """
-    Never allow runlog formatting issues to fail the whole workflow.
-    Runlog is useful, but should not cause exit code 1 after successful scrape.
-    """
+    """Never allow runlog formatting issues to fail the whole workflow."""
     try:
         append_runlog(log_path, info)
     except Exception as e:
@@ -421,53 +514,85 @@ def main():
     run_utc, run_ist = now_times()
     session = get_session()
 
+    rows_appended_total = 0
+    total_rows_after = pd.NA
+    saved_pdf_name = ""
+    chosen_url = ""
+
+    # 0) Always sync manual inputs first (idempotent)
+    copied_manual_pdfs = sync_manual_pdfs(MANUAL_PDF_DIR, PDF_DIR)
+    backfill_added, backfill_total_after = merge_manual_backfill(MANUAL_BACKFILL_FILE, EXCEL_FILE)
+    rows_appended_total += backfill_added
+    if backfill_total_after is not None:
+        total_rows_after = backfill_total_after
+
     # 1) Fetch page & determine PDF URL
-    html = get_html(session, NALCO_URL)
-    pdf_url = find_ingots_pdf_url(html)
+    try:
+        html = get_html(session, NALCO_URL)
+        pdf_url = find_ingots_pdf_url(html)
+    except Exception as e:
+        # If scraping fails but manual backfill succeeded, do not fail the run
+        if rows_appended_total > 0 or copied_manual_pdfs > 0:
+            msg = f"Manual sync done (backfill rows added={backfill_added}, manual PDFs copied={copied_manual_pdfs}). Scrape failed: {e}"
+            print(msg, file=sys.stderr)
+            safe_append_runlog(RUNLOG_FILE, {
+                "Run UTC": run_utc, "Run IST": run_ist, "Status": "UPDATED",
+                "Message": msg, "Chosen URL": "", "Saved PDF": "",
+                "Rows Appended": rows_appended_total, "Total Rows After": total_rows_after
+            })
+            return
+        raise
 
     if not pdf_url:
+        # If no PDF found but manual backfill succeeded, do not fail the run
+        if rows_appended_total > 0 or copied_manual_pdfs > 0:
+            msg = f"No Ingots PDF link found. Manual sync done (backfill rows added={backfill_added}, manual PDFs copied={copied_manual_pdfs})."
+            print(msg, file=sys.stderr)
+            safe_append_runlog(RUNLOG_FILE, {
+                "Run UTC": run_utc, "Run IST": run_ist, "Status": "UPDATED",
+                "Message": msg, "Chosen URL": "", "Saved PDF": "",
+                "Rows Appended": rows_appended_total, "Total Rows After": total_rows_after
+            })
+            return
+
         msg = "No Ingots PDF link found on the page."
         print(msg, file=sys.stderr)
-        safe_append_runlog(
-            RUNLOG_FILE,
-            {
-                "Run UTC": run_utc,
-                "Run IST": run_ist,
-                "Status": "SKIPPED",
-                "Message": msg,
-                "Chosen URL": "",
-                "Saved PDF": "",
-                "Rows Appended": 0,
-                "Total Rows After": pd.NA,
-            },
-        )
+        safe_append_runlog(RUNLOG_FILE, {
+            "Run UTC": run_utc, "Run IST": run_ist, "Status": "SKIPPED",
+            "Message": msg, "Chosen URL": "", "Saved PDF": "",
+            "Rows Appended": 0, "Total Rows After": pd.NA
+        })
         sys.exit(1)
 
+    chosen_url = pdf_url
     print(f"Chosen PDF URL: {pdf_url}")
 
     # 2) Check if changed
     last = read_last_url()
     if pdf_url == last:
-        msg = "No change in PDF. Skipping download & Excel update."
-        print(msg)
-        safe_append_runlog(
-            RUNLOG_FILE,
-            {
-                "Run UTC": run_utc,
-                "Run IST": run_ist,
-                "Status": "SKIPPED",
-                "Message": msg,
-                "Chosen URL": pdf_url,
-                "Saved PDF": "",
-                "Rows Appended": 0,
-                "Total Rows After": pd.NA,
-            },
-        )
+        # If manual backfill happened, call it UPDATED; else SKIPPED
+        if rows_appended_total > 0 or copied_manual_pdfs > 0:
+            msg = f"No change in PDF. Manual sync done (backfill rows added={backfill_added}, manual PDFs copied={copied_manual_pdfs})."
+            print(msg)
+            safe_append_runlog(RUNLOG_FILE, {
+                "Run UTC": run_utc, "Run IST": run_ist, "Status": "UPDATED",
+                "Message": msg, "Chosen URL": pdf_url, "Saved PDF": "",
+                "Rows Appended": rows_appended_total, "Total Rows After": total_rows_after
+            })
+        else:
+            msg = "No change in PDF. Skipping download & Excel update."
+            print(msg)
+            safe_append_runlog(RUNLOG_FILE, {
+                "Run UTC": run_utc, "Run IST": run_ist, "Status": "SKIPPED",
+                "Message": msg, "Chosen URL": pdf_url, "Saved PDF": "",
+                "Rows Appended": 0, "Total Rows After": pd.NA
+            })
         return
 
     # 3) Download new PDF
     pdf_path = download_pdf(session, pdf_url)
     write_last_url(pdf_url)
+    saved_pdf_name = pdf_path.name
     print(f"Saved to: {pdf_path}")
 
     # 4) Extract IE07 row from PDF
@@ -484,23 +609,16 @@ def main():
     row["Circular Link"] = pdf_url
 
     # 7) Update main Excel
-    total_rows = append_to_excel(EXCEL_FILE, row)
+    added, total_rows_after = append_to_excel(EXCEL_FILE, row)
+    rows_appended_total += added
     print(f"Excel updated: {EXCEL_FILE}")
 
-    # 8) Update runlog (safe)
-    safe_append_runlog(
-        RUNLOG_FILE,
-        {
-            "Run UTC": run_utc,
-            "Run IST": run_ist,
-            "Status": "UPDATED",
-            "Message": "New circular processed.",
-            "Chosen URL": pdf_url,
-            "Saved PDF": pdf_path.name,
-            "Rows Appended": 1,
-            "Total Rows After": total_rows,
-        },
-    )
+    msg = f"Processed new circular. Manual backfill rows added={backfill_added}, manual PDFs copied={copied_manual_pdfs}."
+    safe_append_runlog(RUNLOG_FILE, {
+        "Run UTC": run_utc, "Run IST": run_ist, "Status": "UPDATED",
+        "Message": msg, "Chosen URL": pdf_url, "Saved PDF": saved_pdf_name,
+        "Rows Appended": rows_appended_total, "Total Rows After": total_rows_after
+    })
 
 if __name__ == "__main__":
     main()
