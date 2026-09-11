@@ -9,11 +9,6 @@ on:
 permissions:
   contents: write
 
-env:
-  # NALCO's legacy HTTPS certificate chain is rejected by the hosted runner.
-  # The scraper limits this exception to NALCO requests and logs a warning.
-  NALCO_INSECURE_TLS: "1"
-
 jobs:
   scrape:
     runs-on: ubuntu-latest
@@ -37,6 +32,35 @@ jobs:
 
       - name: Run scraper
         run: |
+          # NALCO's legacy HTTPS certificate chain is rejected by the
+          # GitHub-hosted runner. Patch the two NALCO requests at runtime so
+          # this fix works even if nalco_scraper.py itself has not changed.
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path("nalco_scraper.py")
+          s = p.read_text(encoding="utf-8")
+
+          old_page = "session.get(url, timeout=60)"
+          new_page = "session.get(url, timeout=60, verify=False)"
+          old_pdf = "session.get(url, headers=headers, timeout=60, stream=True, allow_redirects=True)"
+          new_pdf = "session.get(url, headers=headers, timeout=60, stream=True, allow_redirects=True, verify=False)"
+
+          changed = False
+          if old_page in s:
+              s = s.replace(old_page, new_page)
+              changed = True
+          if old_pdf in s:
+              s = s.replace(old_pdf, new_pdf)
+              changed = True
+
+          if not changed:
+              print("NALCO TLS patch already present or source pattern changed; continuing.")
+          else:
+              p.write_text(s, encoding="utf-8")
+              print("Applied NALCO TLS fallback to page and PDF requests.")
+          PY
+
           python nalco_scraper.py
 
       - name: Upload artifacts (always)
