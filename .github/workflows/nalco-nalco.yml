@@ -9,6 +9,11 @@ on:
 permissions:
   contents: write
 
+env:
+  # NALCO's legacy HTTPS certificate chain is rejected by the hosted runner.
+  # The scraper limits this exception to NALCO requests and logs a warning.
+  NALCO_INSECURE_TLS: "1"
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
