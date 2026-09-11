@@ -81,7 +81,7 @@ def get_session():
 # ---------------------- SCRAPER UTILS ----------------------
 
 def get_html(session: requests.Session, url: str) -> str:
-    r = session.get(url, timeout=60)
+    r = session.get(url, timeout=60, verify=False)
     r.raise_for_status()
     return r.text
 
@@ -126,7 +126,7 @@ def download_pdf(session: requests.Session, url: str) -> pathlib.Path:
         "Accept": "application/pdf,*/*;q=0.9",
         "Accept-Language": "en-US,en;q=0.9",
     }
-    with session.get(url, headers=headers, timeout=60, stream=True, allow_redirects=True) as r:
+    with session.get(url, headers=headers, timeout=60, stream=True, allow_redirects=True, verify=False) as r:
         r.raise_for_status()
         ctype = (r.headers.get("Content-Type", "") or "").lower()
         if "application/pdf" not in ctype:
